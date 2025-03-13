@@ -18,9 +18,53 @@ from nltk.tokenize import word_tokenize
 import datetime
 from dateutil.parser import parse as date_parse
 import email.utils
+import logging
+import time
+import random
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("ragbot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("ragbot")
+
+# Log startup
+logger.info("RAG Chatbot System initializing...")
 
 # Load environment variables
 load_dotenv()
+logger.info("Environment variables loaded from .env file")
+
+# Validate required environment variables
+def validate_environment():
+    """Validate that all required environment variables are set."""
+    required_vars = [
+        "PINECONE_API_KEY", 
+        "PINECONE_ENVIRONMENT", 
+        "OPENAI_API_KEY"
+    ]
+    
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logger.error("Missing required environment variables: %s", ", ".join(missing_vars))
+        print("ERROR: The following required environment variables are missing:")
+        for var in missing_vars:
+            print(f"  - {var}")
+        print("\nPlease create a .env file with these variables or set them in your environment.")
+        print("Example .env file:")
+        print("PINECONE_API_KEY=your_pinecone_api_key")
+        print("PINECONE_ENVIRONMENT=your_pinecone_environment")
+        print("OPENAI_API_KEY=your_openai_api_key")
+        return False
+    
+    logger.info("All required environment variables are set")
+    return True
 
 # Paperspace data configuration
 PAPERSPACE_STORAGE = {
@@ -39,12 +83,44 @@ LOCAL_DATA_PATH = "combined_documents_deduplicated.json"
 
 # Determine which data path to use
 def get_data_path():
-    if os.path.exists("/storage"):
-        print("Using Paperspace mounted storage")
+    """Determine the correct data path based on the environment.
+    Returns the appropriate path for data files depending on whether 
+    running on Paperspace or locally.
+    """
+    # Check for Paperspace environment variables as primary indicator
+    if os.environ.get('PAPERSPACE_NOTEBOOK_REPO') or os.environ.get('PAPERSPACE_GRADIENT_RUN_ID'):
+        logger.info("Detected Paperspace environment variables")
         return PAPERSPACE_DATA_PATH
-    else:
-        print("Using local storage")
-        return LOCAL_DATA_PATH
+    
+    # Secondary check: verify /storage mount point exists and is accessible
+    if os.path.exists("/storage") and os.access("/storage", os.R_OK):
+        try:
+            # Try to list the directory to confirm it's properly mounted
+            storage_contents = os.listdir("/storage")
+            if storage_contents:
+                logger.info("Using Paperspace mounted storage")
+                
+                # Check if the specific dataset file exists
+                if os.path.exists(PAPERSPACE_DATA_PATH):
+                    logger.info("Found dataset at %s", PAPERSPACE_DATA_PATH)
+                    return PAPERSPACE_DATA_PATH
+                else:
+                    logger.warning("Dataset file not found at %s", PAPERSPACE_DATA_PATH)
+                    logger.info("Searching for alternative dataset files...")
+                    
+                    # Search for any JSON files in datasets directory
+                    datasets_dir = "/storage/datasets"
+                    if os.path.exists(datasets_dir):
+                        json_files = [f for f in os.listdir(datasets_dir) if f.endswith('.json')]
+                        if json_files:
+                            alt_dataset = os.path.join(datasets_dir, json_files[0])
+                            logger.info("Found alternative dataset file: %s", alt_dataset)
+                            return alt_dataset
+        except Exception as e:
+            logger.error("Error accessing Paperspace storage: %s", str(e), exc_info=True)
+
+    logger.info("Using local storage at %s", LOCAL_DATA_PATH)
+    return LOCAL_DATA_PATH
 
 # Download NLTK resources
 nltk.download('punkt')
@@ -295,35 +371,132 @@ class DataProcessor:
         """Generate embeddings for texts"""
         return self.model.encode(texts)
 
+def exponential_backoff_retry(operation_func, max_retries=3, base_delay=1, max_delay=8):
+    """
+    Execute the operation with exponential backoff retry logic.
+    
+    Args:
+        operation_func: Function to execute (should return a value or raise an exception)
+        max_retries: Maximum number of retries before giving up
+        base_delay: Initial delay in seconds
+        max_delay: Maximum delay in seconds
+        
+    Returns:
+        Result of the operation function or None if all retries failed
+    """
+    retries = 0
+    while retries <= max_retries:
+        try:
+            if retries > 0:
+                logger.info(f"Retry attempt {retries}/{max_retries}")
+            
+            return operation_func()
+            
+        except Exception as e:
+            if retries == max_retries:
+                logger.error(f"Operation failed after {max_retries} retries: {str(e)}")
+                return None
+            
+            # Calculate delay with exponential backoff and jitter
+            delay = min(base_delay * (2 ** retries) + random.uniform(0, 1), max_delay)
+            
+            logger.warning(f"Operation failed: {str(e)}. Retrying in {delay:.2f} seconds...")
+            time.sleep(delay)
+            retries += 1
+
 class PineconeManager:
     def __init__(self, api_key: str, environment: str, index_name: str, dimension: int = 384):
         self.api_key = api_key
         self.environment = environment
         self.index_name = index_name
         self.dimension = dimension
+        logger.info("Initializing PineconeManager with index %s", index_name)
         self.initialize_pinecone()
         
     def initialize_pinecone(self):
         """Initialize Pinecone connection and index"""
-        pinecone.init(api_key=self.api_key, environment=self.environment)
-        
-        # Check if index exists, if not create it
-        if self.index_name not in pinecone.list_indexes():
-            pinecone.create_index(
-                name=self.index_name,
-                dimension=self.dimension,
-                metric="cosine"
-            )
-        
-        self.index = pinecone.Index(self.index_name)
+        try:
+            logger.info("Connecting to Pinecone (environment: %s)", self.environment)
+            pinecone.init(api_key=self.api_key, environment=self.environment)
+            
+            # Check if index exists, if not create it
+            if self.index_name not in pinecone.list_indexes():
+                logger.info("Creating new Pinecone index: %s", self.index_name)
+                
+                def create_index_operation():
+                    pinecone.create_index(
+                        name=self.index_name,
+                        dimension=self.dimension,
+                        metric="cosine"
+                    )
+                    return True
+                
+                result = exponential_backoff_retry(create_index_operation)
+                if result:
+                    logger.info("Successfully created index %s", self.index_name)
+                else:
+                    raise Exception("Failed to create Pinecone index after retries")
+            else:
+                logger.info("Using existing Pinecone index: %s", self.index_name)
+            
+            self.index = pinecone.Index(self.index_name)
+            logger.info("Successfully connected to Pinecone index: %s", self.index_name)
+        except Exception as e:
+            logger.error("Failed to initialize Pinecone: %s", str(e), exc_info=True)
+            print(f"ERROR initializing Pinecone: {str(e)}")
+            print("Please check your Pinecone API key and environment.")
+            raise
     
     def upsert_vectors(self, vectors: List[Dict[str, Any]]):
         """Insert or update vectors in the index"""
-        self.index.upsert(vectors=vectors)
+        try:
+            if not vectors:
+                logger.warning("Empty vector list provided to upsert_vectors")
+                print("Warning: Empty vector list provided to upsert_vectors")
+                return True
+            
+            logger.info("Upserting %d vectors to Pinecone", len(vectors))
+            
+            def upsert_operation():
+                self.index.upsert(vectors=vectors)
+                return True
+            
+            result = exponential_backoff_retry(upsert_operation)
+            
+            if result:
+                logger.info("Successfully upserted vectors to Pinecone")
+                return True
+            else:
+                logger.error("Failed to upsert vectors to Pinecone after retries")
+                return False
+                
+        except Exception as e:
+            logger.error("Failed to upsert vectors to Pinecone: %s", str(e), exc_info=True)
+            print(f"ERROR upserting vectors to Pinecone: {str(e)}")
+            return False
     
     def query(self, query_vector: List[float], top_k: int = 5) -> Dict:
         """Query the index with a vector"""
-        return self.index.query(vector=query_vector, top_k=top_k, include_metadata=True)
+        try:
+            logger.info("Querying Pinecone with top_k=%d", top_k)
+            
+            def query_operation():
+                return self.index.query(vector=query_vector, top_k=top_k, include_metadata=True)
+            
+            results = exponential_backoff_retry(query_operation)
+            
+            if results:
+                logger.info("Successfully queried Pinecone, found %d matches", len(results.get("matches", [])))
+                return results
+            else:
+                logger.error("Failed to query Pinecone after retries")
+                return {"matches": []}
+                
+        except Exception as e:
+            logger.error("Failed to query Pinecone: %s", str(e), exc_info=True)
+            print(f"ERROR querying Pinecone: {str(e)}")
+            # Return empty results structure on error
+            return {"matches": []}
 
 def count_conversations(json_file_path: str):
     """Count the number of conversations and messages in the JSON file"""
@@ -353,20 +526,24 @@ def process_and_store_conversations(json_file_path: str = None):
     if json_file_path is None:
         json_file_path = get_data_path()
     
-    print(f"Processing data from: {json_file_path}")
+    logger.info("Processing data from: %s", json_file_path)
     
     # Initialize processor
     processor = DataProcessor()
     
     # Load conversations
+    logger.info("Loading conversations from file")
     conversations = processor.load_conversations(json_file_path)
     
     # Count and print statistics
     stats = count_conversations(json_file_path)
     
+    logger.info("Processing %d conversations with %d total messages", 
+                stats['num_conversations'], stats['total_messages'])
     print(f"Processing {stats['num_conversations']} conversations with {stats['total_messages']} total messages")
     
     # Extract texts for processing
+    logger.info("Extracting message texts")
     texts = []
     for convo in conversations:
         if "messages" in convo:
@@ -375,22 +552,27 @@ def process_and_store_conversations(json_file_path: str = None):
                     texts.append(message["content"])
     
     # Preprocess texts
+    logger.info("Preprocessing %d texts", len(texts))
     print("Preprocessing texts...")
     preprocessed_texts = [processor.preprocess_text(text) for text in texts]
     
     # Extract keywords
+    logger.info("Extracting keywords")
     print("Extracting keywords...")
     keywords_dict = processor.extract_keywords(preprocessed_texts)
     
     # Categorize conversations
+    logger.info("Categorizing texts")
     print("Categorizing texts...")
     categories = processor.categorize_conversations(preprocessed_texts)
     
     # Generate embeddings
+    logger.info("Generating embeddings for %d texts", len(preprocessed_texts))
     print("Generating embeddings...")
     embeddings = processor.generate_embeddings(preprocessed_texts)
     
     # Initialize Pinecone
+    logger.info("Initializing Pinecone connection")
     print("Initializing Pinecone...")
     pinecone_manager = PineconeManager(
         api_key=os.getenv("PINECONE_API_KEY"),
@@ -399,11 +581,17 @@ def process_and_store_conversations(json_file_path: str = None):
     )
     
     # Prepare vectors for Pinecone
+    logger.info("Preparing vectors with metadata")
     print("Preparing vectors...")
     vectors = []
     for i, embedding in enumerate(embeddings):
         # Extract comprehensive metadata
-        print(f"Extracting metadata for document {i+1}/{len(embeddings)}...", end="\r")
+        progress_pct = (i + 1) / len(embeddings) * 100
+        print(f"Extracting metadata: {i+1}/{len(embeddings)} ({progress_pct:.1f}%)", end="\r")
+        
+        if i % 10 == 0:  # Log every 10th item to avoid excessive logging
+            logger.debug("Processing document %d/%d", i+1, len(embeddings))
+            
         enriched_metadata = processor.extract_comprehensive_metadata(texts[i])
         
         # Combine with existing metadata
@@ -424,14 +612,33 @@ def process_and_store_conversations(json_file_path: str = None):
         vectors.append(vector)
     
     print("\nUploading vectors to Pinecone...")
+    logger.info("Uploading %d vectors to Pinecone in batches", len(vectors))
+    
     # Store vectors in batches (Pinecone has a limit)
     batch_size = 100
     total_batches = (len(vectors) + batch_size - 1) // batch_size
+    
     for i in range(0, len(vectors), batch_size):
         batch_num = i // batch_size + 1
-        print(f"Uploading batch {batch_num}/{total_batches}...", end="\r")
-        pinecone_manager.upsert_vectors(vectors[i:i+batch_size])
+        end_idx = min(i + batch_size, len(vectors))
+        
+        # Calculate progress percentage
+        progress_pct = batch_num / total_batches * 100
+        
+        # Log the batch upload
+        logger.info("Uploading batch %d/%d (%d vectors)", batch_num, total_batches, end_idx - i)
+        
+        # Display progress
+        print(f"Uploading batch {batch_num}/{total_batches} ({progress_pct:.1f}%)...", end="\r")
+        
+        # Upload the batch
+        success = pinecone_manager.upsert_vectors(vectors[i:end_idx])
+        
+        if not success:
+            logger.error("Failed to upload batch %d/%d", batch_num, total_batches)
+            print(f"\nError uploading batch {batch_num}. Please check the logs for details.")
     
+    logger.info("Data processing and upload complete")
     print("\nData processing complete!")
     return "Data processed and stored successfully with enhanced metadata!"
 
@@ -448,6 +655,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import os
+from llama_model import LlamaInstructModel
 
 # Initialize FastAPI app
 app = FastAPI(title="RAG Chatbot API")
@@ -461,14 +669,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add a middleware to log all requests
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start_time = datetime.datetime.now()
+    path = request.url.path
+    method = request.method
+    
+    # Skip logging static file requests to reduce noise
+    if path.startswith("/static"):
+        return await call_next(request)
+    
+    logger.info(f"Request: {method} {path}")
+    
+    try:
+        response = await call_next(request)
+        process_time = (datetime.datetime.now() - start_time).total_seconds() * 1000
+        logger.info(f"Response: {method} {path} - Status: {response.status_code} - Time: {process_time:.2f}ms")
+        return response
+    except Exception as e:
+        logger.error(f"Error processing request {method} {path}: {str(e)}", exc_info=True)
+        raise
+
 # Set up templates for the web interface
 templates = Jinja2Templates(directory="templates")
 
 # Serve static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Load environment variables
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # Initialize processor and Pinecone manager
 processor = DataProcessor()
@@ -477,6 +704,18 @@ pinecone_manager = PineconeManager(
     environment=os.getenv("PINECONE_ENVIRONMENT"),
     index_name="gpt-conversations"
 )
+
+# Initialize the Llama model (lazily - will be created when first needed)
+llama_model = None
+
+def get_llama_model():
+    global llama_model
+    if llama_model is None:
+        logger.info("Initializing Llama model for the first time")
+        # Choose the appropriate model - you can change to a different Llama variant
+        model_name = "NousResearch/Llama-2-7b-chat-hf"  # A free model on Hugging Face
+        llama_model = LlamaInstructModel(model_name=model_name)
+    return llama_model
 
 # Define request and response models
 class ChatRequest(BaseModel):
@@ -496,13 +735,18 @@ async def get_web_interface(request: Request):
 async def chat(request: ChatRequest):
     """Process a chat request using RAG"""
     try:
+        logger.info("Received chat request: '%s'", request.query[:50] + "..." if len(request.query) > 50 else request.query)
+        
         # Preprocess query
         processed_query = processor.preprocess_text(request.query)
+        logger.debug("Preprocessed query: '%s'", processed_query)
         
         # Generate embedding for the query
+        logger.info("Generating embedding for query")
         query_embedding = processor.model.encode(processed_query).tolist()
         
         # Retrieve relevant documents from Pinecone
+        logger.info("Retrieving relevant documents from Pinecone")
         results = pinecone_manager.query(query_vector=query_embedding, top_k=3)
         
         # Extract contexts from the results
@@ -511,12 +755,14 @@ async def chat(request: ChatRequest):
             if "metadata" in match and "text" in match["metadata"]:
                 contexts.append(match["metadata"]["text"])
         
-        # Construct prompt with retrieved contexts
-        prompt = f"""
-        Answer the following question based on the provided contexts. If the contexts don't contain relevant information, 
-        say that you don't know but provide a general response if possible.
+        logger.info("Retrieved %d relevant contexts", len(contexts))
         
-        Contexts:
+        # Construct prompt with retrieved contexts
+        system_prompt = "You are a helpful assistant. Answer the question accurately based on the provided context."
+        
+        user_prompt = f"""
+        Answer based on the following contexts:
+        
         {' '.join(contexts)}
         
         Chat History:
@@ -525,18 +771,12 @@ async def chat(request: ChatRequest):
         Question: {request.query}
         """
         
-        # Generate response using OpenAI
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500
-        )
+        # Generate response using Llama model
+        logger.info("Generating response using Llama model")
+        llama_model = get_llama_model()
+        answer = llama_model.generate_response(system_prompt, user_prompt)
         
-        # Extract and return the response
-        answer = response.choices[0].message.content
+        logger.info("Generated response: '%s'", answer[:50] + "..." if len(answer) > 50 else answer)
         
         # Format sources for the response
         sources = []
@@ -549,9 +789,12 @@ async def chat(request: ChatRequest):
                     "category": match["metadata"].get("category", -1)
                 })
         
+        logger.info("Returning response with %d sources", len(sources))
         return ChatResponse(response=answer, sources=sources)
     
     except Exception as e:
+        logger.error("Error in chat endpoint: %s", str(e), exc_info=True)
+        print(f"Error in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Function to start the server
@@ -891,38 +1134,90 @@ with open("static/script.js", "w") as f:
 
 def main():
     """Main function to run the application"""
+    logger.info("Starting RAG Chatbot System")
     print("RAG Chatbot System")
+    
+    # Validate environment variables before proceeding
+    if not validate_environment():
+        logger.error("Environment validation failed. Exiting.")
+        print("Environment validation failed. Exiting.")
+        return
+    
     print("1. Count records in conversations file")
     print("2. Process and store conversations")
     print("3. Start the web server")
     print("4. Process Paperspace mounted data")
     
-    choice = input("Enter your choice (1-4): ")
-    
-    if choice == "1":
-        json_file = input("Enter the path to your conversations.json file: ")
-        try:
-            stats = count_conversations(json_file)
-            print(f"\nStatistics for {json_file}:")
-            print(f"Number of conversations: {stats['num_conversations']}")
-            print(f"Total number of messages: {stats['total_messages']}")
-            print(f"Average messages per conversation: {stats['total_messages']/stats['num_conversations']:.2f}")
-        except Exception as e:
-            print(f"Error counting records: {str(e)}")
-    elif choice == "2":
-        json_file = input("Enter the path to your conversations.json file: ")
-        result = process_and_store_conversations(json_file)
-        print(result)
-    elif choice == "3":
-        print("Starting web server...")
-        start_server()
-    elif choice == "4":
-        print("Processing data from Paperspace mounted storage...")
-        data_path = get_data_path()
-        result = process_and_store_conversations(data_path)
-        print(result)
-    else:
-        print("Invalid choice!")
+    try:
+        choice = input("Enter your choice (1-4): ")
+        logger.info("User selected option: %s", choice)
+        
+        if choice == "1":
+            json_file = input("Enter the path to your conversations.json file: ")
+            logger.info("Counting records in file: %s", json_file)
+            try:
+                stats = count_conversations(json_file)
+                logger.info("Count completed: %d conversations, %d total messages", 
+                           stats['num_conversations'], stats['total_messages'])
+                print(f"\nStatistics for {json_file}:")
+                print(f"Number of conversations: {stats['num_conversations']}")
+                print(f"Total number of messages: {stats['total_messages']}")
+                print(f"Average messages per conversation: {stats['total_messages']/stats['num_conversations']:.2f}")
+            except FileNotFoundError:
+                logger.error("File not found: %s", json_file)
+                print(f"Error: File {json_file} not found. Please check the path and try again.")
+            except json.JSONDecodeError:
+                logger.error("Invalid JSON file: %s", json_file)
+                print(f"Error: File {json_file} is not a valid JSON file.")
+            except Exception as e:
+                logger.error("Error counting records: %s", str(e), exc_info=True)
+                print(f"Error counting records: {str(e)}")
+        elif choice == "2":
+            json_file = input("Enter the path to your conversations.json file: ")
+            logger.info("Processing conversations from file: %s", json_file)
+            if not os.path.exists(json_file):
+                logger.error("File not found: %s", json_file)
+                print(f"Error: File {json_file} not found. Please check the path and try again.")
+                return
+                
+            result = process_and_store_conversations(json_file)
+            logger.info("Processing completed: %s", result)
+            print(result)
+        elif choice == "3":
+            logger.info("Starting web server...")
+            print("Starting web server...")
+            try:
+                start_server()
+            except Exception as e:
+                logger.error("Error starting server: %s", str(e), exc_info=True)
+                print(f"Error starting server: {str(e)}")
+                print("Please check that the port is not already in use and try again.")
+        elif choice == "4":
+            logger.info("Processing data from Paperspace mounted storage")
+            print("Processing data from Paperspace mounted storage...")
+            try:
+                data_path = get_data_path()
+                if not os.path.exists(data_path):
+                    logger.error("Paperspace dataset not found at %s", data_path)
+                    print(f"Error: Paperspace dataset not found at {data_path}")
+                    print("Please check that the storage is properly mounted.")
+                    return
+                    
+                result = process_and_store_conversations(data_path)
+                logger.info("Processing completed: %s", result)
+                print(result)
+            except Exception as e:
+                logger.error("Error processing Paperspace data: %s", str(e), exc_info=True)
+                print(f"Error processing Paperspace data: {str(e)}")
+        else:
+            logger.warning("Invalid choice: %s", choice)
+            print("Invalid choice! Please enter a number between 1 and 4.")
+    except KeyboardInterrupt:
+        logger.info("Operation cancelled by user")
+        print("\nOperation cancelled by user.")
+    except Exception as e:
+        logger.error("Unexpected error: %s", str(e), exc_info=True)
+        print(f"An unexpected error occurred: {str(e)}")
 
 if __name__ == "__main__":
     main()
